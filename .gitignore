@@ -1,0 +1,21 @@
+# Dossiers générés par WebAudit
+logs/
+screenshots/
+reports/audit_report_*
+
+# Environnements virtuels
+venv/
+env/
+.env
+
+# Cache Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Fichiers système
+.DS_Store
+Thumbs.db

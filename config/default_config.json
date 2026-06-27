@@ -1,0 +1,66 @@
+{
+  "target": {
+    "url": "http://localhost:3000",
+    "source_dir": null,
+    "api_base": "/api"
+  },
+  "auth": {
+    "jwt_token": null,
+    "username": null,
+    "password": null,
+    "login_url": null,
+    "oauth_client_id": null,
+    "oauth_client_secret": null
+  },
+  "database": {
+    "connection_string": null,
+    "db_type": null
+  },
+  "performance": {
+    "max_response_time_ms": 3000,
+    "max_page_load_ms": 5000,
+    "max_bundle_size_kb": 500,
+    "max_image_size_kb": 200,
+    "lcp_threshold_ms": 2500,
+    "cls_threshold": 0.1,
+    "fid_threshold_ms": 100,
+    "ttfb_threshold_ms": 800
+  },
+  "security": {
+    "test_injections": true,
+    "test_csrf": true,
+    "test_headers": true,
+    "custom_payloads_file": null,
+    "max_injection_tests": 50
+  },
+  "report": {
+    "output_dir": "reports",
+    "formats": ["html", "json"],
+    "include_screenshots": true,
+    "include_recommendations": true,
+    "language": "fr"
+  },
+  "crawl": {
+    "max_pages": 100,
+    "max_depth": 5,
+    "follow_external": false,
+    "respect_robots": true,
+    "request_delay_ms": 100,
+    "timeout_s": 30,
+    "user_agent": "WebAudit/1.0 (Automated Security & Quality Scanner)"
+  },
+  "modules_enabled": [
+    "discovery",
+    "backend",
+    "api",
+    "frontend",
+    "security",
+    "performance",
+    "ux",
+    "javascript",
+    "auth",
+    "mobile",
+    "screenshots"
+  ],
+  "verbose": false
+}
