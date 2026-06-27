@@ -8,7 +8,6 @@ and other JavaScript issues using Playwright.
 from __future__ import annotations
 
 import asyncio
-from typing import Any
 
 from audit.base import BaseAuditor
 from audit.result import AuditResult, Severity
@@ -34,54 +33,46 @@ class JavaScriptAuditor(BaseAuditor):
             self.info("JS Audit", "Playwright not installed — skipping browser-based JS checks")
             return self.build_result()
 
+        from utils.playwright_pool import get_pool
+
+        async def _audit_page(context) -> None:
+            page = await context.new_page()
+            console_errors: list[dict] = []
+            console_warnings: list[dict] = []
+            console_logs: list[dict] = []
+            page_errors: list[str] = []
+
+            page.on("console", lambda msg: self._handle_console(
+                msg, console_errors, console_warnings, console_logs
+            ))
+            page.on("pageerror", lambda err: page_errors.append(str(err)))
+
+            await page.goto(self._base_url, wait_until="networkidle", timeout=30000)
+            await asyncio.sleep(3)
+
+            self._analyze_console_errors(console_errors)
+            self._analyze_console_warnings(console_warnings)
+            self._analyze_page_errors(page_errors)
+            await self._check_memory(page)
+            await self._check_deprecated_apis(page)
+            self._check_console_logs(console_logs)
+            await self._check_network_errors(page)
+            await page.close()
+
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(viewport={"width": 1920, "height": 1080})
-                page = await context.new_page()
-
-                # Collect console messages
-                console_errors: list[dict] = []
-                console_warnings: list[dict] = []
-                console_logs: list[dict] = []
-                page_errors: list[str] = []
-
-                page.on("console", lambda msg: self._handle_console(
-                    msg, console_errors, console_warnings, console_logs
-                ))
-                page.on("pageerror", lambda err: page_errors.append(str(err)))
-
-                # Navigate
-                await page.goto(self._base_url, wait_until="networkidle", timeout=30000)
-                await asyncio.sleep(3)  # Wait for JS to execute
-
-                # 1. Console errors
-                self._analyze_console_errors(console_errors)
-
-                # 2. Console warnings
-                self._analyze_console_warnings(console_warnings)
-
-                # 3. Page errors (unhandled exceptions)
-                self._analyze_page_errors(page_errors)
-
-                # 4. Memory usage
-                await self._check_memory(page)
-
-                # 5. Unhandled promise rejections
-                unhandled = await page.evaluate("""() => {
-                    return window.__unhandledRejections || [];
-                }""")
-
-                # 6. Check for deprecated APIs
-                await self._check_deprecated_apis(page)
-
-                # 7. Check for console.log in production
-                self._check_console_logs(console_logs)
-
-                # 8. Network errors
-                await self._check_network_errors(page)
-
-                await browser.close()
+            pool = get_pool()
+            if pool and pool.is_ready:
+                context = await pool.new_context(viewport={"width": 1920, "height": 1080})
+                try:
+                    await _audit_page(context)
+                finally:
+                    await context.close()
+            else:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True)
+                    context = await browser.new_context(viewport={"width": 1920, "height": 1080})
+                    await _audit_page(context)
+                    await browser.close()
 
         except Exception as e:
             self.logger.error(f"JavaScript audit failed: {e}")

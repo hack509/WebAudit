@@ -35,20 +35,22 @@ class MobileAuditor(BaseAuditor):
             self.info("Mobile Audit", "Playwright not installed — skipping mobile checks")
             return self.build_result()
 
+        from utils.playwright_pool import get_pool
+
+        async def _run_with_browser(browser) -> None:
+            await self._test_mobile_portrait(browser)
+            await self._test_mobile_landscape(browser)
+            await self._test_tablet(browser)
+
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-
-                # Test mobile viewport (portrait)
-                await self._test_mobile_portrait(browser)
-
-                # Test mobile viewport (landscape)
-                await self._test_mobile_landscape(browser)
-
-                # Test tablet viewport
-                await self._test_tablet(browser)
-
-                await browser.close()
+            pool = get_pool()
+            if pool and pool.is_ready:
+                await _run_with_browser(pool._browser)
+            else:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True)
+                    await _run_with_browser(browser)
+                    await browser.close()
 
         except Exception as e:
             self.logger.error(f"Mobile audit failed: {e}")

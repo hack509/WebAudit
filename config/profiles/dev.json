@@ -1,0 +1,7 @@
+{
+  "target": { "url": "http://localhost:3000" },
+  "crawl": { "max_pages": 20, "request_delay_ms": 50 },
+  "report": { "formats": ["html", "json"], "language": "fr" },
+  "security": { "test_injections": true, "test_csrf": true },
+  "verbose": true
+}

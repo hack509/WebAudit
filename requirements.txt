@@ -1,43 +1,49 @@
-# WebAudit - Dependencies
-# Core HTTP
-requests>=2.31.0
-aiohttp>=3.9.0
+# WebAudit - Pinned Dependencies
+# Generated: 2026-06-27
+# To update: pip install pip-tools && pip-compile requirements.in
+
+# Core HTTP (unified sync+async via httpx)
+httpx==0.27.2
 
 # HTML/CSS Parsing
-beautifulsoup4>=4.12.0
-lxml>=5.1.0
-cssutils>=2.9.0
+beautifulsoup4==4.15.0
+lxml==6.1.1
+cssutils==2.15.0
 
 # Browser Automation
-playwright>=1.40.0
+playwright==1.60.0
 
 # Image Processing
-Pillow>=10.2.0
+Pillow==12.2.0
+
+# REST API + dashboard
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
 
 # Reporting
-Jinja2>=3.1.0
-fpdf2>=2.7.0
+Jinja2==3.1.6
+fpdf2==2.8.7
 
 # Terminal UI
-rich>=13.7.0
-colorama>=0.4.6
+rich==15.0.0
+colorama==0.4.6
 
 # Data Validation
-pydantic>=2.5.0
+pydantic==2.13.4
 
 # JWT
-PyJWT>=2.8.0
+PyJWT==2.13.0
 
 # Database
-SQLAlchemy>=2.0.0
+SQLAlchemy==2.0.51
 
 # System Metrics
-psutil>=5.9.0
+psutil==7.2.2
 
 # Testing
-pytest>=8.0.0
-pytest-asyncio>=0.23.0
-pytest-cov>=4.1.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-cov==7.1.0
 
 # Async
-asyncio-throttle>=1.0.0
+asyncio-throttle==1.0.2

@@ -1,30 +1,74 @@
 """
-HTTP Client Wrapper for WebAudit.
+HTTP Client Wrapper for WebAudit — unified sync+async via httpx.
 
-Provides synchronous and asynchronous HTTP clients with retry, timeout,
-authentication, and error handling.
+Replaces the previous requests (sync) + aiohttp (async) dual-stack
+with a single httpx-based implementation that shares the same interface
+for both modes. Adds rate limiting (token-bucket) and GET-response caching.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
-import aiohttp
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+import httpx
 
 from utils.logger import get_logger
 
 logger = get_logger("http_client")
 
+_DEFAULT_HEADERS = {
+    "User-Agent": "WebAudit/1.0 (Automated Security & Quality Scanner)",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+}
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter (async)
+# ---------------------------------------------------------------------------
+
+class RateLimiter:
+    """Token-bucket rate limiter with exponential back-off on HTTP 429.
+
+    Call `await acquire()` before every async request.
+    Call `backoff_on_429()` when the server returns 429.
+    Call `reset_backoff()` after any successful response.
+    """
+
+    def __init__(self, requests_per_second: float = 10.0, max_backoff_s: float = 60.0):
+        self._min_interval = 1.0 / max(requests_per_second, 0.1)
+        self._max_backoff = max_backoff_s
+        self._last_request: float = 0.0
+        self._backoff: float = 1.0
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            wait = self._min_interval - (now - self._last_request)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last_request = time.monotonic()
+
+    async def backoff_on_429(self) -> None:
+        logger.warning(f"Rate-limited (429) — backing off {self._backoff:.1f}s")
+        await asyncio.sleep(self._backoff)
+        self._backoff = min(self._backoff * 2, self._max_backoff)
+
+    def reset_backoff(self) -> None:
+        self._backoff = 1.0
+
+
+# ---------------------------------------------------------------------------
+# Shared response dataclass (unchanged interface)
+# ---------------------------------------------------------------------------
 
 @dataclass
 class HttpResponse:
-    """Normalized HTTP response."""
+    """Normalised HTTP response shared by both sync and async clients."""
 
     status_code: int
     headers: dict[str, str]
@@ -53,8 +97,64 @@ class HttpResponse:
         return self.status_code >= 500
 
 
+class CaseInsensitiveDict(dict):
+    """Dict with case-insensitive key lookups — preserves the behaviour of requests.Response.headers."""
+
+    def __setitem__(self, key: str, value: str) -> None:
+        super().__setitem__(key.lower(), value)
+
+    def __getitem__(self, key: str) -> str:
+        return super().__getitem__(key.lower())
+
+    def get(self, key: str, default=None):
+        return super().get(key.lower(), default)
+
+    def __contains__(self, key: object) -> bool:
+        return super().__contains__(str(key).lower())
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "CaseInsensitiveDict":
+        obj = cls()
+        for k, v in d.items():
+            obj[k] = v
+        return obj
+
+
+def _to_http_response(resp: httpx.Response, elapsed_ms: float, method: str) -> HttpResponse:
+    json_body = None
+    try:
+        json_body = resp.json()
+    except Exception:
+        pass
+    return HttpResponse(
+        status_code=resp.status_code,
+        headers=CaseInsensitiveDict.from_dict(dict(resp.headers)),
+        body=resp.text,
+        json_data=json_body,
+        elapsed_ms=elapsed_ms,
+        url=str(resp.url),
+        method=method.upper(),
+        size_bytes=len(resp.content),
+    )
+
+
+def _error_response(url: str, method: str, elapsed_ms: float, error: str) -> HttpResponse:
+    return HttpResponse(
+        status_code=0, headers={}, body="",
+        elapsed_ms=elapsed_ms, url=url, method=method.upper(), error=error,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Synchronous client (httpx.Client — replaces requests.Session)
+# ---------------------------------------------------------------------------
+
 class HttpClient:
-    """Synchronous HTTP client with retry and timeout support."""
+    """Synchronous HTTP client built on httpx.Client.
+
+    Drop-in replacement for the previous requests-based implementation.
+    Suitable for use inside async audit methods when called from sync helpers.
+    """
 
     def __init__(
         self,
@@ -64,32 +164,18 @@ class HttpClient:
         jwt_token: Optional[str] = None,
         verify_ssl: bool = True,
     ):
-        self.timeout = timeout
-        self.user_agent = user_agent
-        self.jwt_token = jwt_token
-        self.verify_ssl = verify_ssl
+        headers = {**_DEFAULT_HEADERS, "User-Agent": user_agent}
+        if jwt_token:
+            headers["Authorization"] = f"Bearer {jwt_token}"
 
-        self.session = requests.Session()
-
-        # Configure retries
-        retry_strategy = Retry(
-            total=max_retries,
-            backoff_factor=0.5,
-            status_forcelist=[429, 500, 502, 503, 504],
+        transport = httpx.HTTPTransport(retries=max_retries)
+        self._client = httpx.Client(
+            headers=headers,
+            timeout=float(timeout),
+            verify=verify_ssl,
+            transport=transport,
+            follow_redirects=True,
         )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
-
-        # Default headers
-        self.session.headers.update({
-            "User-Agent": self.user_agent,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
-        })
-
-        if self.jwt_token:
-            self.session.headers["Authorization"] = f"Bearer {self.jwt_token}"
 
     def request(
         self,
@@ -101,40 +187,21 @@ class HttpClient:
         params: Optional[dict] = None,
         allow_redirects: bool = True,
     ) -> HttpResponse:
-        """Make an HTTP request and return a normalized response."""
         start = time.perf_counter()
         try:
-            resp = self.session.request(
+            resp = self._client.request(
                 method=method.upper(),
                 url=url,
                 headers=headers,
-                data=data,
+                content=data,
                 json=json_data,
                 params=params,
-                timeout=self.timeout,
-                verify=self.verify_ssl,
-                allow_redirects=allow_redirects,
+                follow_redirects=allow_redirects,
             )
             elapsed = (time.perf_counter() - start) * 1000
+            return _to_http_response(resp, elapsed, method)
 
-            json_body = None
-            try:
-                json_body = resp.json()
-            except (ValueError, TypeError):
-                pass
-
-            return HttpResponse(
-                status_code=resp.status_code,
-                headers=dict(resp.headers),
-                body=resp.text,
-                json_data=json_body,
-                elapsed_ms=elapsed,
-                url=str(resp.url),
-                method=method.upper(),
-                size_bytes=len(resp.content),
-            )
-
-        except requests.exceptions.Timeout:
+        except httpx.TimeoutException:
             elapsed = (time.perf_counter() - start) * 1000
             logger.warning(f"Timeout on {method.upper()} {url}")
             return HttpResponse(
@@ -142,22 +209,14 @@ class HttpClient:
                 elapsed_ms=elapsed, url=url, method=method.upper(),
                 error="Request timed out",
             )
-        except requests.exceptions.ConnectionError as e:
-            elapsed = (time.perf_counter() - start) * 1000
-            logger.error(f"Connection error on {method.upper()} {url}: {e}")
-            return HttpResponse(
-                status_code=0, headers={}, body="",
-                elapsed_ms=elapsed, url=url, method=method.upper(),
-                error=f"Connection error: {e}",
-            )
-        except Exception as e:
+        except httpx.RequestError as e:
             elapsed = (time.perf_counter() - start) * 1000
             logger.error(f"Request error on {method.upper()} {url}: {e}")
-            return HttpResponse(
-                status_code=0, headers={}, body="",
-                elapsed_ms=elapsed, url=url, method=method.upper(),
-                error=str(e),
-            )
+            return _error_response(url, method, elapsed, str(e))
+        except Exception as e:
+            elapsed = (time.perf_counter() - start) * 1000
+            logger.error(f"Unexpected error on {method.upper()} {url}: {e}")
+            return _error_response(url, method, elapsed, str(e))
 
     def get(self, url: str, **kwargs) -> HttpResponse:
         return self.request("GET", url, **kwargs)
@@ -181,11 +240,39 @@ class HttpClient:
         return self.request("HEAD", url, **kwargs)
 
     def close(self) -> None:
-        self.session.close()
+        self._client.close()
 
+    def __enter__(self) -> "HttpClient":
+        return self
+
+    def __exit__(self, *_: Any) -> None:
+        self.close()
+
+
+# ---------------------------------------------------------------------------
+# TTL cache entry
+# ---------------------------------------------------------------------------
+
+class _CacheEntry:
+    __slots__ = ("response", "expires_at")
+
+    def __init__(self, response: HttpResponse, ttl_s: float):
+        self.response = response
+        self.expires_at = time.monotonic() + ttl_s
+
+
+# ---------------------------------------------------------------------------
+# Asynchronous client (httpx.AsyncClient — replaces aiohttp)
+# ---------------------------------------------------------------------------
 
 class AsyncHttpClient:
-    """Asynchronous HTTP client for concurrent requests."""
+    """Asynchronous HTTP client built on httpx.AsyncClient.
+
+    Features:
+    - Concurrency cap via asyncio.Semaphore
+    - Token-bucket rate limiting with 429 back-off
+    - In-memory TTL cache for GET requests (default: 5 min)
+    """
 
     def __init__(
         self,
@@ -194,34 +281,36 @@ class AsyncHttpClient:
         user_agent: str = "WebAudit/1.0",
         jwt_token: Optional[str] = None,
         verify_ssl: bool = True,
+        requests_per_second: float = 10.0,
+        cache_ttl_s: float = 300.0,
     ):
-        self.timeout = aiohttp.ClientTimeout(total=timeout)
-        self.max_concurrent = max_concurrent
-        self.user_agent = user_agent
-        self.jwt_token = jwt_token
-        self.verify_ssl = verify_ssl
+        headers = {**_DEFAULT_HEADERS, "User-Agent": user_agent, "Accept": "*/*"}
+        if jwt_token:
+            headers["Authorization"] = f"Bearer {jwt_token}"
+
+        self._client = httpx.AsyncClient(
+            headers=headers,
+            timeout=float(timeout),
+            verify=verify_ssl,
+            transport=httpx.AsyncHTTPTransport(retries=2),
+            follow_redirects=True,
+        )
         self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._rate_limiter = RateLimiter(requests_per_second=requests_per_second)
+        self._cache: dict[str, _CacheEntry] = {}
+        self._cache_ttl = cache_ttl_s
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            headers = {
-                "User-Agent": self.user_agent,
-                "Accept": "*/*",
-            }
-            if self.jwt_token:
-                headers["Authorization"] = f"Bearer {self.jwt_token}"
+    def _cache_get(self, key: str) -> Optional[HttpResponse]:
+        entry = self._cache.get(key)
+        if entry is None:
+            return None
+        if time.monotonic() > entry.expires_at:
+            del self._cache[key]
+            return None
+        return entry.response
 
-            connector = aiohttp.TCPConnector(
-                ssl=self.verify_ssl,
-                limit=self.max_concurrent,
-            )
-            self._session = aiohttp.ClientSession(
-                timeout=self.timeout,
-                headers=headers,
-                connector=connector,
-            )
-        return self._session
+    def _cache_set(self, key: str, response: HttpResponse) -> None:
+        self._cache[key] = _CacheEntry(response, self._cache_ttl)
 
     async def request(
         self,
@@ -231,52 +320,51 @@ class AsyncHttpClient:
         data: Optional[Any] = None,
         json_data: Optional[Any] = None,
     ) -> HttpResponse:
-        """Make an async HTTP request."""
+        method_upper = method.upper()
+
+        # Serve from cache for GET requests
+        if method_upper == "GET":
+            cached = self._cache_get(url)
+            if cached is not None:
+                logger.debug(f"Cache hit: {url}")
+                return cached
+
+        await self._rate_limiter.acquire()
+
         async with self._semaphore:
-            session = await self._get_session()
             start = time.perf_counter()
             try:
-                async with session.request(
-                    method=method.upper(),
+                resp = await self._client.request(
+                    method=method_upper,
                     url=url,
                     headers=headers,
-                    data=data,
+                    content=data,
                     json=json_data,
-                ) as resp:
-                    body = await resp.text()
-                    elapsed = (time.perf_counter() - start) * 1000
+                )
+                elapsed = (time.perf_counter() - start) * 1000
 
-                    json_body = None
-                    try:
-                        json_body = await resp.json(content_type=None)
-                    except (ValueError, TypeError):
-                        pass
+                if resp.status_code == 429:
+                    await self._rate_limiter.backoff_on_429()
+                else:
+                    self._rate_limiter.reset_backoff()
 
-                    return HttpResponse(
-                        status_code=resp.status,
-                        headers=dict(resp.headers),
-                        body=body,
-                        json_data=json_body,
-                        elapsed_ms=elapsed,
-                        url=str(resp.url),
-                        method=method.upper(),
-                        size_bytes=len(body.encode()),
-                    )
+                result = _to_http_response(resp, elapsed, method)
 
-            except asyncio.TimeoutError:
+                if method_upper == "GET" and result.is_success:
+                    self._cache_set(url, result)
+
+                return result
+
+            except httpx.TimeoutException:
                 elapsed = (time.perf_counter() - start) * 1000
                 return HttpResponse(
                     status_code=408, headers={}, body="",
-                    elapsed_ms=elapsed, url=url, method=method.upper(),
+                    elapsed_ms=elapsed, url=url, method=method_upper,
                     error="Request timed out",
                 )
             except Exception as e:
                 elapsed = (time.perf_counter() - start) * 1000
-                return HttpResponse(
-                    status_code=0, headers={}, body="",
-                    elapsed_ms=elapsed, url=url, method=method.upper(),
-                    error=str(e),
-                )
+                return _error_response(url, method, elapsed, str(e))
 
     async def get(self, url: str, **kwargs) -> HttpResponse:
         return await self.request("GET", url, **kwargs)
@@ -285,5 +373,10 @@ class AsyncHttpClient:
         return await self.request("POST", url, **kwargs)
 
     async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
+        await self._client.aclose()
+
+    async def __aenter__(self) -> "AsyncHttpClient":
+        return self
+
+    async def __aexit__(self, *_: Any) -> None:
+        await self.close()

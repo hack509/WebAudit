@@ -19,8 +19,7 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Prompt, IntPrompt
-from rich.text import Text
+from rich.prompt import Prompt, IntPrompt, Confirm
 
 from config.settings import AuditConfig
 from audit.runner import AuditRunner
@@ -71,7 +70,17 @@ def parse_args() -> argparse.Namespace:
         description=f"{APP_NAME} v{APP_VERSION} — {APP_DESCRIPTION}",
     )
     parser.add_argument("--url", type=str, help="Target URL to audit")
+    parser.add_argument(
+        "--urls", type=str, nargs="+", metavar="URL",
+        help="Multiple target URLs to audit in parallel",
+    )
     parser.add_argument("--source", type=str, help="Path to source code directory")
+    parser.add_argument(
+        "--serve", action="store_true",
+        help="Start the WebAudit REST API + dashboard server",
+    )
+    parser.add_argument("--host", type=str, default="0.0.0.0", help="API server host (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8000, help="API server port (default: 8000)")
     parser.add_argument("--token", type=str, help="JWT token for authenticated requests")
     parser.add_argument("--user", type=str, help="Username for auth tests")
     parser.add_argument("--password", type=str, help="Password for auth tests")
@@ -86,16 +95,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--module", type=str, nargs="+", help="Specific modules to run")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument("--lang", type=str, default="fr", choices=["fr", "en"], help="Report language")
+    parser.add_argument(
+        "--accept-tos", action="store_true",
+        help="Confirm you have authorization to test the target (required in non-interactive mode)",
+    )
+    parser.add_argument(
+        "--profile", type=str, choices=["dev", "staging", "prod", "ci"],
+        help="Load a named configuration profile (dev/staging/prod/ci)",
+    )
 
     return parser.parse_args()
 
 
 def build_config(args: argparse.Namespace) -> AuditConfig:
-    """Build AuditConfig from CLI args or config file."""
-    if args.config:
-        config = AuditConfig.from_json(args.config)
+    """Build AuditConfig from profile → JSON file → CLI args → env vars (increasing priority)."""
+    # 1. Start from profile (lowest priority)
+    if getattr(args, "profile", None):
+        config = AuditConfig.from_profile(args.profile)
     else:
         config = AuditConfig()
+
+    # 2. JSON file overrides profile
+    if args.config:
+        config = AuditConfig.from_json(args.config)
 
     # Override with CLI args
     if args.url:
@@ -116,6 +138,9 @@ def build_config(args: argparse.Namespace) -> AuditConfig:
         config.verbose = True
     if args.lang:
         config.report.language = args.lang
+
+    # 4. Environment variables (highest priority — useful in CI)
+    config.apply_env_overrides()
 
     return config
 
@@ -144,6 +169,41 @@ def show_menu() -> int:
     return choice
 
 
+def show_legal_disclaimer() -> bool:
+    """Display a legal disclaimer and require explicit user confirmation.
+
+    Returns True if the user accepts, False otherwise.
+    """
+    console.print()
+    console.print(
+        Panel(
+            "[bold yellow]AVERTISSEMENT LÉGAL / LEGAL WARNING[/bold yellow]\n\n"
+            "[white]WebAudit effectue des tests actifs (requêtes HTTP, injections de test,\n"
+            "crawl automatique) sur la cible spécifiée.\n\n"
+            "⚠️  UTILISER UNIQUEMENT SUR DES SYSTÈMES QUE VOUS POSSÉDEZ\n"
+            "    OU POUR LESQUELS VOUS AVEZ UNE AUTORISATION ÉCRITE EXPLICITE.\n\n"
+            "L'utilisation non autorisée sur des systèmes tiers est illégale\n"
+            "et engage votre responsabilité pénale et civile.\n\n"
+            "[dim]WebAudit performs active tests (HTTP requests, test payloads, crawling)\n"
+            "on the specified target. Use only on systems you own or have explicit\n"
+            "written authorization to test.[/dim][/white]",
+            title="[bold red]⚠️  Conditions d'utilisation[/bold red]",
+            border_style="red",
+            padding=(1, 2),
+        )
+    )
+
+    confirmed = Confirm.ask(
+        "[bold]Je confirme avoir l'autorisation de tester cette cible[/bold]",
+        default=False,
+    )
+
+    if not confirmed:
+        console.print("\n[red]Audit annulé — autorisation non confirmée.[/red]\n")
+
+    return confirmed
+
+
 def prompt_url(config: AuditConfig) -> AuditConfig:
     """Prompt for the target URL if not set."""
     if not config.target.url or config.target.url == "http://localhost:3000":
@@ -153,6 +213,37 @@ def prompt_url(config: AuditConfig) -> AuditConfig:
         )
         config.target.url = url
     return config
+
+
+async def run_multi_targets(
+    urls: list[str],
+    base_config: AuditConfig,
+    modules: list[str] | None = None,
+) -> None:
+    """Run audits for multiple URLs in parallel and summarise results."""
+    console.print(f"\n[bold cyan]Multi-target audit — {len(urls)} cibles[/bold cyan]")
+
+    async def _audit_one(url: str) -> tuple[str, float | None, str | None]:
+        cfg = base_config.model_copy(deep=True)
+        cfg.target.url = url
+        runner = AuditRunner(cfg)
+        runner.register_all_auditors()
+        try:
+            report = await (runner.run_selected(modules) if modules else runner.run_all())
+            return url, report.global_score, report.global_grade
+        except Exception as e:
+            console.print(f"[red]  ✗ {url}: {e}[/red]")
+            return url, None, None
+
+    results = await asyncio.gather(*[_audit_one(u) for u in urls])
+
+    console.print()
+    for url, score, grade in results:
+        if score is not None:
+            color = "green" if score >= 80 else "yellow" if score >= 60 else "red"
+            console.print(f"  [{color}]{grade} {score:.1f}/100[/{color}]  {url}")
+        else:
+            console.print(f"  [red]FAIL[/red]  {url}")
 
 
 async def run_audit(config: AuditConfig, modules: list[str] | None = None) -> None:
@@ -184,6 +275,9 @@ async def run_audit(config: AuditConfig, modules: list[str] | None = None) -> No
 async def run_interactive(config: AuditConfig) -> None:
     """Run the interactive menu loop."""
     console.print(BANNER)
+
+    if not show_legal_disclaimer():
+        return
 
     config = prompt_url(config)
 
@@ -258,16 +352,53 @@ def main() -> None:
     Path("screenshots").mkdir(exist_ok=True)
 
     try:
+        if getattr(args, "serve", False):
+            # Start API server + dashboard
+            console.print(BANNER)
+            console.print(
+                Panel(
+                    f"[bold]WebAudit API server[/bold]\n\n"
+                    f"  Dashboard : [cyan]http://{args.host}:{args.port}/[/cyan]\n"
+                    f"  API docs  : [cyan]http://{args.host}:{args.port}/api/docs[/cyan]\n"
+                    f"  Redoc     : [cyan]http://{args.host}:{args.port}/api/redoc[/cyan]",
+                    title="[bold green]🚀 Lancement du serveur[/bold green]",
+                    border_style="green",
+                )
+            )
+            import uvicorn
+            from api.app import app
+            uvicorn.run(app, host=args.host, port=args.port)
+            return
+
+        # Multi-target mode
+        urls = getattr(args, "urls", None)
+        if urls:
+            if not getattr(args, "accept_tos", False):
+                console.print(BANNER)
+                if not show_legal_disclaimer():
+                    sys.exit(0)
+            asyncio.run(run_multi_targets(urls, config, args.module))
+            return
+
         if args.url and not sys.stdin.isatty():
-            # Non-interactive: direct audit
+            # Non-interactive (CI/pipeline): skip disclaimer, user must set --accept-tos
+            if not getattr(args, "accept_tos", False):
+                console.print(
+                    "[red]En mode non-interactif, ajoutez --accept-tos pour confirmer "
+                    "que vous avez l'autorisation de tester cette cible.[/red]"
+                )
+                sys.exit(1)
             logger.info(f"Starting audit for {config.target.url}")
             modules = args.module if args.module else None
             asyncio.run(run_audit(config, modules))
         elif args.url:
-            # URL provided but interactive terminal
+            # URL provided, interactive terminal — show disclaimer once
+            console.print(BANNER)
+            if not show_legal_disclaimer():
+                sys.exit(0)
             asyncio.run(run_audit(config, args.module))
         else:
-            # Interactive menu
+            # Interactive menu (disclaimer shown inside run_interactive)
             asyncio.run(run_interactive(config))
 
     except KeyboardInterrupt:

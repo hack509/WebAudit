@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WebAudit — Dashboard</title>
+<style>
+  :root {
+    --bg: #0f1117; --card: #1a1d27; --border: #2a2d3e;
+    --text: #e2e8f0; --muted: #64748b; --accent: #6366f1;
+    --green: #22c55e; --yellow: #eab308; --red: #ef4444; --orange: #f97316;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; min-height: 100vh; }
+  header { background: var(--card); border-bottom: 1px solid var(--border); padding: 1rem 2rem; display: flex; align-items: center; gap: 1rem; }
+  header h1 { font-size: 1.25rem; font-weight: 700; color: var(--accent); }
+  header span { color: var(--muted); font-size: 0.875rem; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 2rem 1rem; }
+  .actions { display: flex; gap: 0.75rem; margin-bottom: 2rem; align-items: center; flex-wrap: wrap; }
+  .btn { padding: 0.5rem 1.25rem; border-radius: 0.5rem; border: none; cursor: pointer; font-size: 0.875rem; font-weight: 500; transition: opacity .15s; }
+  .btn:hover { opacity: 0.85; }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-outline { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  input[type=url] { flex: 1; min-width: 260px; padding: 0.5rem 0.875rem; background: var(--card); border: 1px solid var(--border); border-radius: 0.5rem; color: var(--text); font-size: 0.875rem; outline: none; }
+  input[type=url]:focus { border-color: var(--accent); }
+  .badge { display: inline-block; padding: 0.2rem 0.6rem; border-radius: 9999px; font-size: 0.75rem; font-weight: 600; }
+  .badge-A,.badge-B { background: #14532d; color: var(--green); }
+  .badge-C { background: #713f12; color: var(--yellow); }
+  .badge-D,.badge-E { background: #7c2d12; color: var(--orange); }
+  .badge-F { background: #450a0a; color: var(--red); }
+  .badge-pending { background: #1e3a5f; color: #60a5fa; }
+  .badge-running { background: #312e81; color: #a5b4fc; animation: pulse 1.5s infinite; }
+  .badge-failed  { background: #450a0a; color: var(--red); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border-radius: 0.75rem; overflow: hidden; }
+  th { text-align: left; padding: 0.75rem 1rem; font-size: 0.75rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); background: var(--bg); border-bottom: 1px solid var(--border); }
+  td { padding: 0.875rem 1rem; border-bottom: 1px solid var(--border); font-size: 0.875rem; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: rgba(99,102,241,.05); }
+  .score-bar { width: 80px; height: 6px; background: var(--border); border-radius: 3px; display: inline-block; vertical-align: middle; margin-right: 0.5rem; }
+  .score-fill { height: 100%; border-radius: 3px; }
+  a.detail { color: var(--accent); text-decoration: none; font-size: 0.8rem; }
+  a.detail:hover { text-decoration: underline; }
+  .empty { text-align: center; padding: 3rem; color: var(--muted); }
+  #toast { position: fixed; bottom: 1.5rem; right: 1.5rem; background: var(--card); border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.75rem 1.25rem; font-size: 0.875rem; display: none; z-index: 99; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🔍 WebAudit</h1>
+  <span>Dashboard — Historique des audits</span>
+</header>
+
+<div class="container">
+  <div class="actions">
+    <input type="url" id="urlInput" placeholder="https://example.com" />
+    <select id="profileSelect" style="padding:0.5rem 0.75rem;background:var(--card);border:1px solid var(--border);border-radius:0.5rem;color:var(--text);font-size:0.875rem;">
+      <option value="">Profil par défaut</option>
+      <option value="dev">dev</option>
+      <option value="staging">staging</option>
+      <option value="prod">prod</option>
+      <option value="ci">ci</option>
+    </select>
+    <button class="btn btn-primary" onclick="startAudit()">▶ Lancer un audit</button>
+    <button class="btn btn-outline" onclick="loadHistory()">↻ Actualiser</button>
+  </div>
+
+  <table id="historyTable">
+    <thead>
+      <tr>
+        <th>URL cible</th>
+        <th>Démarré</th>
+        <th>Statut</th>
+        <th>Score</th>
+        <th>Grade</th>
+        <th>Critiques</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="historyBody">
+      <tr><td colspan="7" class="empty">Chargement…</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div id="toast"></div>
+
+<script>
+  const API = '/api/v1';
+
+  async function startAudit() {
+    const url = document.getElementById('urlInput').value.trim();
+    const profile = document.getElementById('profileSelect').value;
+    if (!url) { toast('Entrez une URL cible', 'red'); return; }
+
+    try {
+      const res = await fetch(`${API}/audit`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, profile: profile || null }),
+      });
+      const data = await res.json();
+      if (!res.ok) { toast(data.detail || 'Erreur', 'red'); return; }
+      toast(`Audit lancé — ID: ${data.task_id}`, 'green');
+      setTimeout(loadHistory, 500);
+      // Poll until done
+      pollAudit(data.task_id);
+    } catch (e) {
+      toast('Erreur réseau: ' + e.message, 'red');
+    }
+  }
+
+  async function pollAudit(id) {
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`${API}/audit/${id}`);
+        const data = await res.json();
+        loadHistory();
+        if (data.status === 'completed' || data.status === 'failed') {
+          clearInterval(interval);
+          const msg = data.status === 'completed'
+            ? `✅ Audit terminé — Score: ${data.global_score?.toFixed(1)}/100 (${data.global_grade})`
+            : `❌ Audit échoué`;
+          toast(msg, data.status === 'completed' ? 'green' : 'red');
+        }
+      } catch { clearInterval(interval); }
+    }, 3000);
+  }
+
+  async function loadHistory() {
+    try {
+      const res = await fetch(`${API}/history`);
+      const data = await res.json();
+      renderHistory(data.audits || []);
+    } catch (e) {
+      document.getElementById('historyBody').innerHTML =
+        `<tr><td colspan="7" class="empty">Erreur de chargement: ${e.message}</td></tr>`;
+    }
+  }
+
+  function renderHistory(audits) {
+    const body = document.getElementById('historyBody');
+    if (!audits.length) {
+      body.innerHTML = '<tr><td colspan="7" class="empty">Aucun audit — lancez votre premier audit ci-dessus.</td></tr>';
+      return;
+    }
+    body.innerHTML = audits.map(a => {
+      const score = a.global_score ?? null;
+      const grade = a.global_grade ?? '—';
+      const fillColor = score >= 80 ? '#22c55e' : score >= 60 ? '#eab308' : '#ef4444';
+      const scoreCell = score !== null
+        ? `<span class="score-bar"><span class="score-fill" style="width:${score}%;background:${fillColor}"></span></span>${score.toFixed(1)}`
+        : '—';
+      const critCell = a.critical_count !== undefined ? `<span style="color:var(--red)">${a.critical_count ?? '—'}</span>` : '—';
+      const statusBadge = `<span class="badge badge-${a.status}">${a.status}</span>`;
+      const actions = a.status === 'completed'
+        ? `<a class="detail" href="${API}/audit/${a.id}/report" target="_blank">Rapport JSON</a>`
+        : '';
+      const dt = new Date(a.started_at).toLocaleString('fr-FR');
+      return `<tr>
+        <td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${a.url}">${a.url}</td>
+        <td style="color:var(--muted);white-space:nowrap">${dt}</td>
+        <td>${statusBadge}</td>
+        <td>${scoreCell}</td>
+        <td><span class="badge badge-${grade}">${grade}</span></td>
+        <td>${critCell}</td>
+        <td>${actions}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  function toast(msg, color = 'green') {
+    const el = document.getElementById('toast');
+    el.textContent = msg;
+    el.style.display = 'block';
+    el.style.borderColor = color === 'red' ? 'var(--red)' : 'var(--green)';
+    clearTimeout(el._timer);
+    el._timer = setTimeout(() => { el.style.display = 'none'; }, 4000);
+  }
+
+  loadHistory();
+  // Auto-refresh every 10 s
+  setInterval(loadHistory, 10000);
+</script>
+</body>
+</html>

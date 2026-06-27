@@ -1,0 +1,6 @@
+{
+  "crawl": { "max_pages": 50, "request_delay_ms": 200 },
+  "report": { "formats": ["html", "json", "csv"], "language": "fr" },
+  "security": { "test_injections": true, "test_csrf": true },
+  "verbose": false
+}

@@ -7,10 +7,12 @@ Defines all configuration models using Pydantic for type safety and validation.
 from __future__ import annotations
 
 import json
+import os
+import re
 from pathlib import Path
 from typing import Optional
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, field_validator
 
 
 class TargetConfig(BaseModel):
@@ -32,11 +34,31 @@ class AuthConfig(BaseModel):
     oauth_client_secret: Optional[str] = Field(default=None, description="OAuth client secret")
 
 
+_ALLOWED_DB_SCHEMES = re.compile(
+    r"^(postgresql|postgresql\+psycopg2|postgresql\+asyncpg"
+    r"|mysql|mysql\+pymysql|mysql\+aiomysql"
+    r"|sqlite)://",
+    re.IGNORECASE,
+)
+
+
 class DatabaseConfig(BaseModel):
     """Database configuration for DB auditing."""
 
     connection_string: Optional[str] = Field(default=None, description="Database connection string")
     db_type: Optional[str] = Field(default=None, description="Database type: postgres, mysql, sqlite")
+
+    @field_validator("connection_string", mode="before")
+    @classmethod
+    def validate_connection_string(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if not _ALLOWED_DB_SCHEMES.match(v):
+            raise ValueError(
+                "Invalid database connection string. "
+                "Only postgresql://, mysql://, and sqlite:// schemes are allowed."
+            )
+        return v
 
 
 class PerformanceConfig(BaseModel):
@@ -134,3 +156,57 @@ class AuditConfig(BaseModel):
         config_path.parent.mkdir(parents=True, exist_ok=True)
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(self.model_dump(), f, indent=2, ensure_ascii=False)
+
+    def apply_env_overrides(self) -> "AuditConfig":
+        """Override config fields from WEBAUDIT_* environment variables.
+
+        Supported variables:
+            WEBAUDIT_URL          → target.url
+            WEBAUDIT_TOKEN        → auth.jwt_token
+            WEBAUDIT_USER         → auth.username
+            WEBAUDIT_PASSWORD     → auth.password
+            WEBAUDIT_DB           → database.connection_string
+            WEBAUDIT_VERBOSE      → verbose (1/true/yes)
+            WEBAUDIT_LANG         → report.language
+            WEBAUDIT_OUTPUT       → report.output_dir
+            WEBAUDIT_FORMATS      → report.formats (comma-separated)
+        """
+        env = os.environ
+
+        if url := env.get("WEBAUDIT_URL"):
+            self.target.url = url
+        if token := env.get("WEBAUDIT_TOKEN"):
+            self.auth.jwt_token = token
+        if user := env.get("WEBAUDIT_USER"):
+            self.auth.username = user
+        if password := env.get("WEBAUDIT_PASSWORD"):
+            self.auth.password = password
+        if db := env.get("WEBAUDIT_DB"):
+            self.database.connection_string = db
+        if verbose := env.get("WEBAUDIT_VERBOSE"):
+            self.verbose = verbose.lower() in ("1", "true", "yes")
+        if lang := env.get("WEBAUDIT_LANG"):
+            self.report.language = lang
+        if output := env.get("WEBAUDIT_OUTPUT"):
+            self.report.output_dir = output
+        if formats := env.get("WEBAUDIT_FORMATS"):
+            self.report.formats = [f.strip() for f in formats.split(",") if f.strip()]
+
+        return self
+
+    @classmethod
+    def from_profile(cls, profile: str, base_dir: str | Path = "config/profiles") -> "AuditConfig":
+        """Load a named configuration profile (dev / staging / prod / ci).
+
+        Profiles are JSON files in config/profiles/<name>.json that contain
+        a partial AuditConfig — only the fields you want to override.
+        """
+        profile_path = Path(base_dir) / f"{profile}.json"
+        if not profile_path.exists():
+            raise FileNotFoundError(
+                f"Profile '{profile}' not found at {profile_path}. "
+                f"Available profiles: dev, staging, prod, ci"
+            )
+        with open(profile_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return cls(**data)

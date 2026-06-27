@@ -6,7 +6,6 @@ Manages the execution of selected audit modules and aggregates results.
 
 from __future__ import annotations
 
-import asyncio
 import time
 from datetime import datetime
 from typing import Optional
@@ -20,6 +19,7 @@ from config.settings import AuditConfig
 from audit.base import BaseAuditor
 from audit.result import AuditResult, FullAuditReport
 from utils.logger import get_logger
+from utils.playwright_pool import BrowserPool, set_pool
 from utils.scoring import ScoreCalculator
 
 logger = get_logger("runner")
@@ -73,12 +73,19 @@ class AuditRunner:
             "screenshots": ScreenshotCapturer,
         }
 
+        # Load built-in modules
         for module_name in self.config.modules_enabled:
             if module_name in module_map:
                 auditor = module_map[module_name](self.config)
                 self.register_auditor(auditor)
             else:
                 logger.warning(f"Unknown module: {module_name}")
+
+        # Load external plugins
+        from utils.plugin_loader import load_plugins
+        for name, cls in load_plugins().items():
+            if name not in self.auditors:
+                self.register_auditor(cls(self.config))
 
     async def run_single(self, module_name: str) -> Optional[AuditResult]:
         """Run a single audit module."""
@@ -121,7 +128,7 @@ class AuditRunner:
             return error_result
 
     async def run_all(self) -> FullAuditReport:
-        """Run all registered audit modules sequentially."""
+        """Run all registered audit modules sequentially under a shared browser pool."""
         start = time.perf_counter()
         started_at = datetime.now().isoformat()
 
@@ -136,20 +143,40 @@ class AuditRunner:
         )
         console.print()
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Audit en cours...", total=len(self.auditors))
+        playwright_modules = {"e2e", "javascript", "mobile", "screenshots"}
+        needs_browser = any(m in self.auditors for m in playwright_modules)
 
-            for module_name, auditor in self.auditors.items():
-                progress.update(task, description=f"[cyan]{auditor.MODULE_DESCRIPTION}[/cyan]")
-                await self.run_single(module_name)
-                progress.advance(task)
+        pool = BrowserPool() if needs_browser else None
+
+        try:
+            if pool:
+                try:
+                    await pool.start()
+                    set_pool(pool)
+                except Exception as e:
+                    logger.warning(f"Browser pool failed to start — Playwright modules will use fallback: {e}")
+                    pool = None
+                    set_pool(None)
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+                TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                task = progress.add_task("Audit en cours...", total=len(self.auditors))
+
+                for module_name, auditor in self.auditors.items():
+                    progress.update(task, description=f"[cyan]{auditor.MODULE_DESCRIPTION}[/cyan]")
+                    await self.run_single(module_name)
+                    progress.advance(task)
+
+        finally:
+            if pool:
+                await pool.stop()
+            set_pool(None)
 
         total_duration = (time.perf_counter() - start) * 1000
 

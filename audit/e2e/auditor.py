@@ -8,7 +8,6 @@ search, filters, notifications.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Optional
 
 from audit.base import BaseAuditor
 from audit.result import AuditResult, Severity
@@ -34,31 +33,40 @@ class E2EAuditor(BaseAuditor):
             self.info("E2E Tests", "Playwright not installed — skipping E2E tests")
             return self.build_result()
 
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
-                context = await browser.new_context(viewport={"width": 1920, "height": 1080})
+        from utils.playwright_pool import get_pool
 
-                # 1. Page navigation flow
+        async def _run_with_browser(browser) -> None:
+            context = await browser.new_context(viewport={"width": 1920, "height": 1080})
+            try:
                 await self._test_navigation_flow(context)
-
-                # 2. Auth flow (if credentials provided)
                 if self.config.auth.username and self.config.auth.password:
                     await self._test_auth_flow(context)
-
-                # 3. Form submission flow
                 await self._test_form_flow(context)
-
-                # 4. Search flow
                 await self._test_search_flow(context)
-
-                # 5. Link integrity
                 await self._test_link_flow(context)
-
-                # 6. Error handling
                 await self._test_error_flow(context)
+            finally:
+                await context.close()
 
-                await browser.close()
+        pool = get_pool()
+        try:
+            if pool and pool.is_ready:
+                context = await pool.new_context(viewport={"width": 1920, "height": 1080})
+                try:
+                    await self._test_navigation_flow(context)
+                    if self.config.auth.username and self.config.auth.password:
+                        await self._test_auth_flow(context)
+                    await self._test_form_flow(context)
+                    await self._test_search_flow(context)
+                    await self._test_link_flow(context)
+                    await self._test_error_flow(context)
+                finally:
+                    await context.close()
+            else:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True)
+                    await _run_with_browser(browser)
+                    await browser.close()
 
         except Exception as e:
             self.logger.error(f"E2E tests failed: {e}")
